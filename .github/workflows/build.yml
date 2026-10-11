@@ -1,0 +1,459 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.5
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle)
+          cat > settings.gradle <<'EOF_0'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          EOF_0
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'EOF_1'
+          org.gradle.jvmargs=-Xmx1G
+          minecraft_version=1.20.1
+          yarn_mappings=1.20.1+build.10
+          loader_version=0.15.11
+          fabric_version=0.92.2+1.20.1
+          mod_version=1.0.0
+          maven_group=com.example
+          archives_base_name=speedcmp
+          EOF_1
+          mkdir -p $(dirname build.gradle)
+          cat > build.gradle <<'EOF_2'
+          plugins {
+              id 'fabric-loom' version '1.5-SNAPSHOT'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+          base { archivesName = project.archives_base_name }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") { expand "version": project.version }
+          }
+
+          tasks.withType(JavaCompile).configureEach { it.options.release = 17 }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_17
+              targetCompatibility = JavaVersion.VERSION_17
+          }
+          EOF_2
+          mkdir -p $(dirname src/main/resources/fabric.mod.json)
+          cat > src/main/resources/fabric.mod.json <<'EOF_3'
+          {
+            "schemaVersion": 1,
+            "id": "speedcmp",
+            "version": "${version}",
+            "name": "Speed Compare",
+            "description": "Client-side HUD dot: red if your last-hit target is faster than you, green if slower.",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.speedcmp.SpeedCmp"]
+            },
+            "depends": {
+              "fabricloader": ">=0.15.0",
+              "minecraft": "~1.20.1",
+              "java": ">=17",
+              "fabric-api": "*"
+            }
+          }
+          EOF_3
+          mkdir -p $(dirname src/main/resources/assets/speedcmp/lang/en_us.json)
+          cat > src/main/resources/assets/speedcmp/lang/en_us.json <<'EOF_4'
+          {
+            "key.speedcmp.open": "Open speed dot menu",
+            "category.speedcmp": "Speed Compare"
+          }
+          EOF_4
+          mkdir -p $(dirname src/main/resources/assets/speedcmp/lang/tr_tr.json)
+          cat > src/main/resources/assets/speedcmp/lang/tr_tr.json <<'EOF_5'
+          {
+            "key.speedcmp.open": "Hız göstergesi menüsünü aç",
+            "category.speedcmp": "Hız Karşılaştırma"
+          }
+          EOF_5
+          mkdir -p $(dirname src/main/java/com/example/speedcmp/SpeedCmp.java)
+          cat > src/main/java/com/example/speedcmp/SpeedCmp.java <<'EOF_6'
+          package com.example.speedcmp;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.HudRenderCallback;
+          import net.fabricmc.fabric.api.event.player.AttackEntityCallback;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.client.world.ClientWorld;
+          import net.minecraft.entity.Entity;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.util.ActionResult;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.Properties;
+          import java.util.UUID;
+
+          /**
+           * Sadece client tarafi. Son vurdugun kisinin hizini kendi hizinla karsilastirir.
+           * Rakip hizliysa KIRMIZI, yavassa YESIL, esitse SARI, rakip yoksa GRI daire cizer.
+           * Sadece ekranda gorunen konum degisimlerini olcer, sunucuya hicbir sey gondermez.
+           */
+          public class SpeedCmp implements ClientModInitializer {
+
+              // ---- Ayarlar (menuden degisir) ----
+              static boolean enabled = true;
+              static int size = 12;          // yaricap (GUI pikseli)
+              static double posX = 0.5;      // ekranin yuzdesi (0..1)
+              static double posY = 0.12;
+              static boolean threeD = false; // false: yatay hiz, true: 3B hiz (elytra icin)
+
+              private static final int RED = 0xFFE02020;
+              private static final int GREEN = 0xFF30D030;
+              private static final int YELLOW = 0xFFE0C020;
+              private static final int GRAY = 0xFF808080;
+              private static final double EPS = 0.01; // blok/tick esit sayma toleransi
+
+              private static final Path FILE =
+                  FabricLoader.getInstance().getConfigDir().resolve("speedcmp.properties");
+
+              private static KeyBinding openKey;
+              private static UUID targetId = null;
+              private static Entity lastTarget = null;
+              private static boolean targetPresent = false;
+
+              private static final Tracker me = new Tracker();
+              private static final Tracker op = new Tracker();
+
+              @Override
+              public void onInitializeClient() {
+                  load();
+
+                  openKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                      "key.speedcmp.open", InputUtil.Type.KEYSYM, GLFW.GLFW_KEY_K, "category.speedcmp"));
+
+                  // Son vurulan canliyi rakip olarak sec
+                  AttackEntityCallback.EVENT.register((player, world, hand, entity, hitResult) -> {
+                      if (world.isClient && entity instanceof LivingEntity && entity != player) {
+                          targetId = entity.getUuid();
+                      }
+                      return ActionResult.PASS;
+                  });
+
+                  ClientTickEvents.END_CLIENT_TICK.register(SpeedCmp::tick);
+                  HudRenderCallback.EVENT.register(SpeedCmp::renderHud);
+              }
+
+              // ---------- Hiz olcumu ----------
+
+              private static class Tracker {
+                  double lx, ly, lz;
+                  boolean has = false;
+                  double ema = 0; // yumusatilmis hiz (blok/tick)
+
+                  void reset() { has = false; ema = 0; }
+
+                  void update(Entity e) {
+                      double x = e.getX(), y = e.getY(), z = e.getZ();
+                      if (has) {
+                          double dx = x - lx, dy = y - ly, dz = z - lz;
+                          double v = threeD ? Math.sqrt(dx * dx + dy * dy + dz * dz) : Math.sqrt(dx * dx + dz * dz);
+                          if (v > 8.0) v = ema; // isinlanma/sicrama: yok say
+                          ema += 0.25 * (v - ema);
+                      } else {
+                          ema = 0;
+                      }
+                      lx = x; ly = y; lz = z;
+                      has = true;
+                  }
+              }
+
+              private static Entity resolveTarget(ClientWorld w) {
+                  if (targetId == null) return null;
+                  Entity e = w.getPlayerByUuid(targetId);
+                  if (e != null) return e;
+                  for (Entity x : w.getEntities()) {
+                      if (x.getUuid().equals(targetId)) return x;
+                  }
+                  return null;
+              }
+
+              private static void tick(MinecraftClient mc) {
+                  if (mc.player == null || mc.world == null) {
+                      me.reset();
+                      op.reset();
+                      targetPresent = false;
+                      lastTarget = null;
+                      return;
+                  }
+
+                  while (openKey.wasPressed()) {
+                      if (mc.currentScreen == null) mc.setScreen(new SpeedScreen());
+                  }
+
+                  if (mc.isPaused()) return;
+
+                  me.update(mc.player);
+
+                  Entity t = resolveTarget(mc.world);
+                  if (t == null || t.isRemoved()) {
+                      op.reset();
+                      lastTarget = null;
+                      targetPresent = false;
+                  } else {
+                      if (t != lastTarget) {
+                          op.reset();
+                          lastTarget = t;
+                      }
+                      op.update(t);
+                      targetPresent = true;
+                  }
+              }
+
+              // ---------- Cizim ----------
+
+              private static void renderHud(DrawContext ctx, float tickDelta) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.player == null) return;
+                  if (!enabled && !(mc.currentScreen instanceof SpeedScreen)) return;
+
+                  int color;
+                  if (!targetPresent) {
+                      color = GRAY;
+                  } else {
+                      double d = op.ema - me.ema;
+                      color = d > EPS ? RED : (d < -EPS ? GREEN : YELLOW);
+                  }
+
+                  int cx = (int) (posX * ctx.getScaledWindowWidth());
+                  int cy = (int) (posY * ctx.getScaledWindowHeight());
+                  circle(ctx, cx, cy, size + 2, 0xFF000000);
+                  circle(ctx, cx, cy, size, color);
+              }
+
+              private static void circle(DrawContext ctx, int cx, int cy, int r, int color) {
+                  for (int dy = -r; dy <= r; dy++) {
+                      int dx = (int) Math.sqrt((double) (r * r - dy * dy));
+                      ctx.fill(cx - dx, cy + dy, cx + dx + 1, cy + dy + 1, color);
+                  }
+              }
+
+              // ---------- Kaydet / yukle ----------
+
+              static void save() {
+                  Properties p = new Properties();
+                  p.setProperty("enabled", String.valueOf(enabled));
+                  p.setProperty("size", String.valueOf(size));
+                  p.setProperty("x", String.valueOf(posX));
+                  p.setProperty("y", String.valueOf(posY));
+                  p.setProperty("threeD", String.valueOf(threeD));
+                  try (var w = Files.newBufferedWriter(FILE)) {
+                      p.store(w, "Speed Compare");
+                  } catch (IOException ignored) { }
+              }
+
+              private static void load() {
+                  if (!Files.exists(FILE)) return;
+                  Properties p = new Properties();
+                  try (var r = Files.newBufferedReader(FILE)) {
+                      p.load(r);
+                      enabled = Boolean.parseBoolean(p.getProperty("enabled", "true"));
+                      size = Math.max(4, Math.min(60, Integer.parseInt(p.getProperty("size", "12"))));
+                      posX = Math.max(0, Math.min(1, Double.parseDouble(p.getProperty("x", "0.5"))));
+                      posY = Math.max(0, Math.min(1, Double.parseDouble(p.getProperty("y", "0.12"))));
+                      threeD = Boolean.parseBoolean(p.getProperty("threeD", "false"));
+                  } catch (Exception ignored) { }
+              }
+          }
+          EOF_6
+          mkdir -p $(dirname src/main/java/com/example/speedcmp/SpeedScreen.java)
+          cat > src/main/java/com/example/speedcmp/SpeedScreen.java <<'EOF_7'
+          package com.example.speedcmp;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.SliderWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.function.DoubleConsumer;
+
+          public class SpeedScreen extends Screen {
+
+              private boolean dragging = false;
+              private Slide sliderX;
+              private Slide sliderY;
+
+              public SpeedScreen() {
+                  super(Text.literal("Speed Compare"));
+              }
+
+              @Override
+              protected void init() {
+                  int w = 150, h = 20;
+                  int left = this.width / 2 - 155;
+                  int right = this.width / 2 + 5;
+                  int y0 = this.height - 76;
+
+                  addDrawableChild(new Slide(left, y0, w, h, "Boyut", 4, 60, SpeedCmp.size,
+                      v -> SpeedCmp.size = (int) Math.round(v)));
+                  sliderX = addDrawableChild(new Slide(left, y0 + 22, w, h, "Yatay %", 0, 100, SpeedCmp.posX * 100,
+                      v -> SpeedCmp.posX = v / 100.0));
+                  sliderY = addDrawableChild(new Slide(left, y0 + 44, w, h, "Dikey %", 0, 100, SpeedCmp.posY * 100,
+                      v -> SpeedCmp.posY = v / 100.0));
+
+                  addDrawableChild(ButtonWidget.builder(enabledText(), b -> {
+                      SpeedCmp.enabled = !SpeedCmp.enabled;
+                      b.setMessage(enabledText());
+                  }).dimensions(right, y0, w, h).build());
+
+                  addDrawableChild(ButtonWidget.builder(modeText(), b -> {
+                      SpeedCmp.threeD = !SpeedCmp.threeD;
+                      b.setMessage(modeText());
+                  }).dimensions(right, y0 + 22, w, h).build());
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Bitti"), b -> this.close())
+                      .dimensions(right, y0 + 44, w, h).build());
+              }
+
+              private static Text enabledText() {
+                  return Text.literal("Gösterge: " + (SpeedCmp.enabled ? "Açık" : "Kapalı"));
+              }
+
+              private static Text modeText() {
+                  return Text.literal("Hız: " + (SpeedCmp.threeD ? "3B (elytra)" : "Yatay"));
+              }
+
+              @Override
+              public void render(DrawContext ctx, int mouseX, int mouseY, float delta) {
+                  super.render(ctx, mouseX, mouseY, delta);
+                  ctx.drawCenteredTextWithShadow(this.textRenderer,
+                      Text.literal("Yuvarlağı sürükleyerek taşıyabilirsin"),
+                      this.width / 2, this.height - 92, 0xFFFFFF);
+              }
+
+              // ---- Yuvarlagi surukleme ----
+
+              private boolean inDot(double mx, double my) {
+                  double cx = SpeedCmp.posX * this.width;
+                  double cy = SpeedCmp.posY * this.height;
+                  double dx = mx - cx, dy = my - cy;
+                  double r = SpeedCmp.size + 8;
+                  return dx * dx + dy * dy <= r * r;
+              }
+
+              private void moveDot(double mx, double my) {
+                  SpeedCmp.posX = Math.max(0.0, Math.min(1.0, mx / this.width));
+                  SpeedCmp.posY = Math.max(0.0, Math.min(1.0, my / this.height));
+                  sliderX.sync(SpeedCmp.posX * 100);
+                  sliderY.sync(SpeedCmp.posY * 100);
+              }
+
+              @Override
+              public boolean mouseClicked(double mx, double my, int button) {
+                  if (button == 0) {
+                      boolean onWidget = this.children().stream().anyMatch(c -> c.isMouseOver(mx, my));
+                      if (!onWidget && inDot(mx, my)) {
+                          dragging = true;
+                          moveDot(mx, my);
+                          return true;
+                      }
+                  }
+                  return super.mouseClicked(mx, my, button);
+              }
+
+              @Override
+              public boolean mouseDragged(double mx, double my, int button, double dx, double dy) {
+                  if (dragging) {
+                      moveDot(mx, my);
+                      return true;
+                  }
+                  return super.mouseDragged(mx, my, button, dx, dy);
+              }
+
+              @Override
+              public boolean mouseReleased(double mx, double my, int button) {
+                  dragging = false;
+                  return super.mouseReleased(mx, my, button);
+              }
+
+              @Override
+              public boolean shouldPause() {
+                  return false;
+              }
+
+              @Override
+              public void removed() {
+                  SpeedCmp.save();
+              }
+
+              // ---- Slider ----
+
+              private static class Slide extends SliderWidget {
+                  private final String label;
+                  private final double min, max;
+                  private final DoubleConsumer setter;
+
+                  Slide(int x, int y, int w, int h, String label, double min, double max, double cur, DoubleConsumer setter) {
+                      super(x, y, w, h, Text.empty(), (cur - min) / (max - min));
+                      this.label = label;
+                      this.min = min;
+                      this.max = max;
+                      this.setter = setter;
+                      updateMessage();
+                  }
+
+                  void sync(double cur) {
+                      this.value = Math.max(0.0, Math.min(1.0, (cur - min) / (max - min)));
+                      updateMessage();
+                  }
+
+                  @Override
+                  protected void updateMessage() {
+                      setMessage(Text.literal(label + ": " + Math.round(min + this.value * (max - min))));
+                  }
+
+                  @Override
+                  protected void applyValue() {
+                      setter.accept(min + this.value * (max - min));
+                  }
+              }
+          }
+          EOF_7
+      - name: Build
+        run: gradle build --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: speedcmp-jar
+          path: build/libs/*.jar
